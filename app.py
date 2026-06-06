@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
@@ -9,9 +10,9 @@ import requests
 import streamlit as st
 
 try:
-    from groq import Groq
+    from openai import OpenAI
 except ImportError:  # pragma: no cover
-    Groq = None
+    OpenAI = None
 
 try:
     from pypdf import PdfReader
@@ -21,7 +22,7 @@ except ImportError:  # pragma: no cover
 
 BASE_URL = "https://staging-api.notarity.com"
 BOOKING_FORM_SLUG = "start-vienna-hackathon"
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1")
 DEFAULT_EMAIL = "asetkabdula@gmail.com"
 COUNTRY_ALIASES = {
     "spain": "ES",
@@ -77,7 +78,7 @@ def init_session():
         [
             {
                 "role": "assistant",
-                "content": "What do you need help with? If you do not know, upload the document or tell me what outcome you need.",
+                "content": "What do you need help with? You can upload a document, or describe what you need if you do not have one yet.",
             }
         ],
     )
@@ -98,6 +99,8 @@ def init_session():
     st.session_state.setdefault("pending_document_review", False)
     st.session_state.setdefault("document_review_started", False)
     st.session_state.setdefault("asking_field", None)
+    st.session_state.setdefault("confirming_field", None)
+    st.session_state.setdefault("confirming_value", None)
 
 
 def css():
@@ -230,13 +233,13 @@ def compact(text, limit=12000):
     return " ".join((text or "").split())[:limit]
 
 
-def call_groq_json(api_key, prompt, temperature=0.15):
-    client = Groq(api_key=api_key)
+def call_openai_json(api_key, prompt, temperature=0.15):
+    client = OpenAI(api_key=api_key)
     last_error = None
     for attempt in range(3):
         try:
             response = client.chat.completions.create(
-                model=GROQ_MODEL,
+                model=OPENAI_MODEL,
                 messages=[
                     {"role": "system", "content": "You are a JSON-only assistant. Always respond with valid JSON matching the requested shape."},
                     {"role": "user", "content": json.dumps(prompt)},
@@ -247,7 +250,7 @@ def call_groq_json(api_key, prompt, temperature=0.15):
             return json.loads(response.choices[0].message.content), None
         except Exception as error:
             last_error = error
-            if "429" not in str(error) or attempt == 2:
+            if "429" not in str(error) and "rate_limit" not in str(error).lower() or attempt == 2:
                 break
             time.sleep(1 + attempt)
     return None, last_error
@@ -264,6 +267,50 @@ def normalize_country(value):
         if alias in lowered:
             return code
     return text
+
+
+def normalize_country_strict(value):
+    if not value:
+        return value
+    text = str(value).strip()
+    if len(text) == 2 and text.isalpha():
+        return text.upper()
+    lowered = text.lower().replace("ö", "o").replace("ä", "a").replace("ü", "u").replace("ß", "ss")
+    city_aliases = {"vienna", "wien"}
+    for alias, code in COUNTRY_ALIASES.items():
+        if alias not in city_aliases and alias in lowered:
+            return code
+    return None
+
+
+def parse_address_details(value):
+    text = (value or "").strip()
+    if not text:
+        return {}
+    parts = [part.strip() for part in text.split(",") if part.strip()]
+    details = {"address": parts[0] if parts else text}
+    remaining = parts[1:] if len(parts) > 1 else []
+
+    for index in range(len(remaining) - 1, -1, -1):
+        country = normalize_country_strict(remaining[index])
+        if country:
+            details["countryCode"] = country
+            remaining.pop(index)
+            break
+
+    for index, part in enumerate(list(remaining)):
+        match = re.search(r"\b\d{4,6}\b", part)
+        if match:
+            details["zipCode"] = match.group(0)
+            city = (part[: match.start()] + part[match.end() :]).strip(" ,-;")
+            if city:
+                details["city"] = city
+            remaining.pop(index)
+            break
+
+    if "city" not in details and remaining:
+        details["city"] = remaining[-1]
+    return details
 
 
 def parse_yes_no(value):
@@ -296,7 +343,10 @@ def set_state_path(path, value):
     current = state.get(root) or {}
     if not isinstance(current, dict):
         current = {}
-    current[field] = normalize_country(value) if field == "countryCode" else value
+    if field == "address":
+        current.update(parse_address_details(value))
+    else:
+        current[field] = normalize_country(value) if field == "countryCode" else value
     state[root] = current
 
 
@@ -624,10 +674,6 @@ def required_files_missing():
 def run_automatic_actions(user_text, llm_result):
     messages = []
 
-    if user_asks_show_more(user_text):
-        messages.append(format_more_timeslots())
-        return messages
-
     choice_index = parse_timeslot_choice(user_text)
     slots = offered_timeslot_options()
     if choice_index is not None and choice_index < len(slots):
@@ -660,13 +706,16 @@ def run_automatic_actions(user_text, llm_result):
     if user_confirmed_submit(user_text, llm_result):
         if not st.session_state.price_response:
             messages.append("I need to price the request before I can submit it.")
-        elif required_files_missing() or not uploaded_file_parts():
+        elif required_files_missing():
             messages.append("Before I submit, please upload the required document files so they can be attached to the request.")
         else:
             response = submit_appointment(build_payload(), uploaded_file_parts())
             st.session_state.submit_response = response
-            messages.append(f"I submitted the appointment request. Notarity returned HTTP {response.get('status')}.")
-            st.session_state.submit_confirmation_requested = False
+            if response.get("status") in [200, 201]:
+                messages.append("Your appointment request has been submitted successfully.")
+                st.session_state.submit_confirmation_requested = False
+            else:
+                messages.append("I tried to submit the appointment request, but something went wrong. Please try again in a moment.")
 
     return messages
 
@@ -794,11 +843,11 @@ def build_payload():
     return payload
 
 
-def groq_turn(user_message):
-    api_key = os.environ.get("GROQ_API_KEY") or st.session_state.get("groq_api_key")
-    if not api_key or Groq is None:
+def openai_turn(user_message):
+    api_key = os.environ.get("OPENAI_API_KEY") or st.session_state.get("openai_api_key")
+    if not api_key or OpenAI is None:
         return {
-            "assistantMessage": "I need a working Groq API key to understand this universally. Please set GROQ_API_KEY, then I can continue from your message or inspect an uploaded document.",
+            "assistantMessage": "I need a working OpenAI API key to continue. Please set OPENAI_API_KEY, then I can inspect the document and guide the booking.",
             "stateUpdates": {},
             "selectedProductIds": [],
             "detectedFacts": [],
@@ -813,13 +862,30 @@ def groq_turn(user_message):
         "rules": [
             "Continue a short conversation. Ask exactly one concise question unless ready for pricing.",
             "The customer often does not know what they need. If they say they do not know, ask for a document or ask a broader outcome question.",
+            "A document is optional at the start. If the customer does not have a document, continue by asking what they need notarized or what outcome they want.",
+            "Do not ask the customer to upload a document unless the selected product requires files before final submit.",
+            "If the customer says they do not have the document yet, set documentReady to false and documentsNotReadyYet to true, then continue the booking conversation.",
+            "Examples of no-document needs include notarizing a signature, getting a certified copy, creating a power of attorney, or certifying specific facts.",
             "If the user asks you to read or inspect the document and documentText is empty, ask them to upload the document.",
             "If the user asks you to read or inspect the document and documentText is present, infer only the booking-relevant facts from the document.",
+            "Customers usually do not know the Notarity product they need; never expect them to name a product.",
+            "Use documentText, latestUserMessage, bookingState, and allowedProducts to identify the best product yourself.",
+            "When documentText is available, use it as the primary evidence for product selection.",
+            "If one allowed product clearly matches the document or stated outcome, select it in selectedProductIds and continue to the next missing booking field.",
+            "Only ask a product clarification question when multiple allowedProducts plausibly fit and the documentText does not distinguish them.",
+            "If documentText is unrelated to any allowedProducts, such as a CV/resume or an informational document with no apparent notarization need, do not select a product.",
+            "For unsuitable or unrelated documents, politely say that the document does not appear to match the available notarization services and ask what the customer needs notarized or certified.",
+            "Never force a product match just because products are available; selectedProductIds must stay empty unless the document or user outcome clearly fits an allowed product.",
             "Your goal is to complete a Notarity appointment request, not to fully analyze the document.",
             "Do not ask about legal, business, meeting, transaction, or document-content details unless they are required to choose one allowed product.",
             "If the document type is clear, proceed with product selection and the next missing booking field instead of asking about the document's purpose.",
             "If the user says they do not know, asks you to check the document, or says you do not need that information, never repeat the same question; move to the next missing booking field.",
             "If latestUserMessage answers previousAssistantQuestion, update the matching state field and do not ask for that field again.",
+            "If the customer provides multiple details in one answer, extract and update all matching fields at once; do not ask again for fields already present in that answer.",
+            "If you infer a required field value from documentText, ask the customer to confirm it before treating it as final.",
+            "During document review, prefer confirming extracted required fields before asking for fields that are still unknown.",
+            "For document-derived values, ask in this format: 'I found [value] as the [field label]. Is that correct?'",
+            "When assistantMessage asks for confirmation of a document-derived value, set confirmingField and confirmingValue, and set askingField to null.",
             "Ask only for fields in missingFields unless product selection is truly impossible from allowedProducts and documentText.",
             "Whenever assistantMessage asks the customer for a booking field, set askingField to the exact missingFields path being requested.",
             "If assistantMessage is not asking for a customer field, set askingField to null.",
@@ -836,6 +902,8 @@ def groq_turn(user_message):
         "latestUserMessage": user_message,
         "previousAssistantQuestion": previous_assistant,
         "currentAskingField": st.session_state.get("asking_field"),
+        "currentConfirmingField": st.session_state.get("confirming_field"),
+        "currentConfirmingValue": st.session_state.get("confirming_value"),
         "bookingState": st.session_state.booking_state,
         "schemaSummary": schema_summary(),
         "allowedProducts": allowed,
@@ -883,10 +951,12 @@ def groq_turn(user_message):
             "requestedAction": "none | fetch_timeslots | price | submit",
             "userConfirmedSubmit": "boolean",
             "askingField": "one missing field path you are asking for, e.g. participantEmail or billingDetails.address, or null",
+            "confirmingField": "one field path for a document-derived value being confirmed, or null",
+            "confirmingValue": "the document-derived value being confirmed, or null",
         },
     }
     try:
-        result, error = call_groq_json(api_key, prompt, temperature=0.15)
+        result, error = call_openai_json(api_key, prompt, temperature=0.15)
         if error:
             raise error
         allowed_ids = {product["id"] for product in allowed if product.get("id")}
@@ -894,8 +964,10 @@ def groq_turn(user_message):
         apply_state(result.get("stateUpdates") or {})
         if result["selectedProductIds"]:
             st.session_state.booking_state["selectedProductIds"] = list(dict.fromkeys(result["selectedProductIds"]))
-        st.session_state.asking_field = result.get("askingField") or None
-        return result, f"groq: {GROQ_MODEL}"
+        st.session_state.confirming_field = result.get("confirmingField") or None
+        st.session_state.confirming_value = result.get("confirmingValue") or None
+        st.session_state.asking_field = None if st.session_state.confirming_field else (result.get("askingField") or None)
+        return result, f"openai: {OPENAI_MODEL}"
     except Exception as error:
         st.session_state.llm_error = str(error)
         return {
@@ -916,6 +988,8 @@ def apply_state(updates):
         if key in state and value not in [None, "", [], {}]:
             if key == "destinationCountry":
                 value = normalize_country(value)
+            if isinstance(value, dict) and value.get("address"):
+                value = {**value, **parse_address_details(value.get("address"))}
             if isinstance(value, dict) and isinstance(state.get(key), dict):
                 state[key].update(value)
             else:
@@ -925,6 +999,23 @@ def apply_state(updates):
 def apply_user_answer_from_previous_question(user_text):
     answer = (user_text or "").strip()
     if not answer:
+        return
+    confirming_field = st.session_state.get("confirming_field")
+    if confirming_field:
+        confirmed = parse_yes_no(answer)
+        if confirmed is True:
+            set_state_path(confirming_field, st.session_state.get("confirming_value"))
+            st.session_state.confirming_field = None
+            st.session_state.confirming_value = None
+            return
+        if confirmed is False:
+            st.session_state.confirming_field = None
+            st.session_state.confirming_value = None
+            st.session_state.asking_field = confirming_field
+            return
+        set_state_path(confirming_field, answer)
+        st.session_state.confirming_field = None
+        st.session_state.confirming_value = None
         return
     asking_field = st.session_state.get("asking_field")
     if asking_field:
@@ -950,7 +1041,7 @@ def apply_user_answer_from_previous_question(user_text):
     elif "last name" in previous and "billing" in previous:
         billing["lastName"] = answer
     elif "address" in previous and "billing" in previous:
-        billing["address"] = answer
+        billing.update(parse_address_details(answer))
     elif ("zip" in previous or "postal" in previous) and "billing" in previous:
         billing["zipCode"] = answer
     elif "city" in previous and "billing" in previous:
@@ -984,7 +1075,7 @@ def render_hero():
         <div class="hero">
           <div class="eyebrow">Notarity Copilot</div>
           <div class="hero-title">A short conversation instead of a booking form.</div>
-          <p>Groq understands the customer. Notarity's booking rules keep the appointment valid from start to finish.</p>
+          <p>OpenAI understands the customer. Notarity's booking rules keep the appointment valid from start to finish.</p>
           <span class="pill">No predefined cases</span><span class="pill">Guided by real booking rules</span><span class="pill">Optional document upload</span><span class="pill">Real appointment times</span>
         </div>
         """,
@@ -999,7 +1090,8 @@ def render_chat():
         with st.chat_message(message["role"]):
             st.write(message["content"])
 
-    files = st.file_uploader("Attach documents when available", type=["pdf"], accept_multiple_files=True, key="chat_upload")
+    upload_label = "Uploaded documents" if st.session_state.uploaded_files else "Upload documents if you have them"
+    files = st.file_uploader(upload_label, type=["pdf"], accept_multiple_files=True, key="chat_upload")
     if files != st.session_state.uploaded_files:
         st.session_state.uploaded_files = files
         st.session_state.document_text = "\n".join(f"--- {file.name} ---\n{extract_pdf_text(file.getvalue())}" for file in files or [])
@@ -1009,15 +1101,10 @@ def render_chat():
             st.session_state.messages.append({"role": "assistant", "content": "I received the document and started reviewing it."})
             st.rerun()
 
-    if st.session_state.uploaded_files and st.button("Review uploaded document"):
-        st.session_state.pending_document_review = True
-        st.session_state.document_review_started = False
-        st.rerun()
-
     if st.session_state.pending_document_review and not st.session_state.document_review_started:
         st.session_state.document_review_started = True
         with st.spinner("Reviewing the uploaded document..."):
-            result, source = groq_turn("Inspect the uploaded document and continue the booking flow.")
+            result, source = openai_turn("Inspect the uploaded document and continue the booking flow.")
             action_messages = run_automatic_actions("", result)
         st.session_state.pending_document_review = False
         st.session_state.document_review_started = False
@@ -1031,9 +1118,12 @@ def render_chat():
     user_message = st.chat_input("Reply to the assistant...")
     if user_message:
         st.session_state.messages.append({"role": "user", "content": user_message})
+        if user_asks_show_more(user_message):
+            st.session_state.messages.append({"role": "assistant", "content": format_more_timeslots()})
+            st.rerun()
         apply_user_answer_from_previous_question(user_message)
         with st.spinner("Thinking and checking appointment options..."):
-            result, source = groq_turn(user_message)
+            result, source = openai_turn(user_message)
             action_messages = run_automatic_actions(user_message, result)
         st.session_state.last_llm_json = result
         st.session_state.llm_source = source
@@ -1101,17 +1191,16 @@ def main():
     css()
     render_hero()
 
-    if not os.environ.get("GROQ_API_KEY"):
-        with st.expander("Set Groq API key"):
-            key = st.text_input("Groq API key", type="password", key="groq_key_input")
+    if not os.environ.get("OPENAI_API_KEY"):
+        with st.expander("Set OpenAI API key"):
+            key = st.text_input("OpenAI API key", type="password", key="openai_key_input")
             if key:
-                st.session_state.groq_api_key = key
-                st.success("Groq key stored for this session.")
+                st.session_state.openai_api_key = key
+                st.success("OpenAI key stored for this session.")
 
     left, right = st.columns([2.15, 1])
     with left:
         render_chat()
-        render_price()
     with right:
         render_sidebar()
 
