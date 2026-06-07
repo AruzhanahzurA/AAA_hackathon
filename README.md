@@ -82,10 +82,13 @@ in your browser.
 ## Project Structure
 
 ```text
-├── app.py                # Main Streamlit application, session state management, and UI rendering
-├── requirements.txt      # Python dependencies
-├── .env.example          # Example environment configuration
-├── README.md             # Project documentation
+├── app.py                              # Main Streamlit application (primary submission)
+├── requirements.txt                    # Python dependencies
+├── prompts/                            # Conversation prompts
+├── .env.example                        # Example environment configuration
+├── README.md                           # Project documentation
+├── alternatives/
+│   └── cursor-mcp-assistant/           # Draft alternative — see section below
 └── supporting modules and utilities
 ```
 
@@ -159,9 +162,42 @@ Check that your `OPENAI_API_KEY` is correctly configured and verify that your ac
 
 Submitted to the START Hack Vienna '26 GitHub organisation.
 
-## Alternative solution (draft)
+## Alternative approach: Cursor MCP assistant (draft)
 
-A Cursor MCP-based booking assistant lives in [`alternatives/cursor-mcp-assistant/`](alternatives/cursor-mcp-assistant/README.md). Open that folder as a workspace to run it.
+> **Status:** Work in progress — not part of the main submission.  
+> **Notarity Copilot** (Streamlit, above) is the primary demo. The folder below is an experimental alternative we explored in parallel.
+
+[`alternatives/cursor-mcp-assistant/`](alternatives/cursor-mcp-assistant/README.md) is a separate, self-contained prototype that reimagines the same Notarity booking flow as a **document-first assistant inside Cursor**, powered by an MCP server instead of a web UI.
+
+| | **Notarity Copilot** (main) | **Cursor MCP assistant** (alternative) |
+|---|---|---|
+| **Status** | Submission-ready | Draft / WIP |
+| **Interface** | Streamlit web app | Cursor chat + MCP tools |
+| **Stack** | Python, OpenAI | Node.js, Claude (PDF extraction) |
+| **How to run** | `streamlit run app.py` | Open `alternatives/cursor-mcp-assistant/` as a Cursor workspace |
+
+### What it explores
+
+- Upload a PDF → extract booking fields → ask for missing details → price → submit to Notarity staging
+- Condition-aware form resolution (`resolve_form_state`) against the live booking schema
+- No standalone UI — the demo runs entirely through Cursor Agent + MCP tool calls
+
+### What is still incomplete
+
+- No polished end-user interface; requires Cursor and manual MCP setup
+- PDF extraction needs a personal `ANTHROPIC_API_KEY`
+- Only the Joshua Timms / Spain NIE flow has automated e2e coverage; other personas are untested
+- Features and docs may change without notice
+
+### How to try it (optional)
+
+Full setup instructions are in [`alternatives/cursor-mcp-assistant/README.md`](alternatives/cursor-mcp-assistant/README.md). In short:
+
+1. Open `alternatives/cursor-mcp-assistant/` as your Cursor workspace
+2. `npm install` and set `ANTHROPIC_API_KEY` in a local `.env`
+3. Reload the window so `.cursor/mcp.json` is picked up
+
+Sample PDFs for demos live in `alternatives/cursor-mcp-assistant/samples/`.
 
 ## License
 
