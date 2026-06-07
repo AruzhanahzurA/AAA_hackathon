@@ -20,19 +20,27 @@ try:
 except ImportError:  # pragma: no cover
     PdfReader = None
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 BASE_URL = os.environ.get("NOTARITY_API_BASE_URL", "https://staging-api.notarity.com").rstrip("/")
 WEB_BASE_URL = os.environ.get("NOTARITY_WEB_BASE_URL", "https://staging.notarity.com").rstrip("/")
 BOOKING_FORM_SLUG = os.environ.get("BOOKING_FORM_SLUG", "start-vienna-hackathon")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1")
 NOTARITY_API_KEY = os.environ.get("NOTARITY_API_KEY")
-NOTARITY_DRAFT_PASSWORD = os.environ.get("NOTARITY_DRAFT_PASSWORD", "notarity-challenge-2026")
-DEFAULT_EMAIL = os.environ.get("DEFAULT_DEMO_EMAIL", "asetkabdula@gmail.com")
-DEFAULT_PHONE = os.environ.get("DEFAULT_DEMO_PHONE", "+43000000000")
-DEFAULT_TIMEZONE = os.environ.get("DEFAULT_TIMEZONE", "Europe/Vienna")
+NOTARITY_DRAFT_PASSWORD = os.environ.get("NOTARITY_DRAFT_PASSWORD")
+DEFAULT_EMAIL = os.environ.get("DEFAULT_DEMO_EMAIL")
+DEFAULT_PHONE = os.environ.get("DEFAULT_DEMO_PHONE")
+DEFAULT_TIMEZONE = os.environ.get("DEFAULT_TIMEZONE", "CET")
 NOTARITY_REQUEST_MODE = os.environ.get("NOTARITY_REQUEST_MODE", "debug")
 AT_TIMESLOT_LABEL_FALLBACK = os.environ.get("AT_TIMESLOT_LABEL_FALLBACK")
 DEFAULT_TIMESLOT_LABEL_FALLBACK = os.environ.get("DEFAULT_TIMESLOT_LABEL_FALLBACK")
+
+with open(os.path.join(os.path.dirname(__file__), "prompts", "default.json")) as _f:
+    PROMPT_RULES = json.load(_f)
 
 st.set_page_config(page_title="Notarity Copilot", page_icon="NC", layout="wide")
 
@@ -203,12 +211,15 @@ def price_appointment(payload):
 
 
 def submit_appointment(payload, files_payload):
+    api_key = os.environ.get("NOTARITY_API_KEY") or st.session_state.get("notarity_api_key")
+    if not api_key:
+        return {"status": 401, "body": {"message": "API key is missing. Set NOTARITY_API_KEY."}, "text": "API key is missing."}
     files = [("payload", json.dumps(payload))]
     for item in files_payload:
         files.append(("files", item))
     response = requests.post(
         f"{BASE_URL}/appointment-requests",
-        headers={"accept": "application/json, text/plain, */*", "referer": f"{WEB_BASE_URL}/"},
+        headers={"accept": "application/json, text/plain, */*", "referer": f"{WEB_BASE_URL}/", "x-api-key": api_key},
         files=files,
         timeout=60,
     )
@@ -323,15 +334,6 @@ def parse_address_details(value):
     return details
 
 
-def parse_yes_no(value):
-    normalized = (value or "").strip().lower()
-    if normalized in ["yes", "y", "true", "sure", "ok", "okay", "i do", "correct"]:
-        return True
-    if normalized in ["no", "n", "false", "not", "nope", "i don't", "i do not"]:
-        return False
-    return None
-
-
 def set_state_path(path, value):
     if not path or value in [None, "", [], {}]:
         return
@@ -339,20 +341,21 @@ def set_state_path(path, value):
     if path == "destinationCountry":
         value = normalize_country(value)
     if path in ["hardCopy", "expressShipping", "contactDetailsSameAsBilling", "shippingDetailsSameAsBilling"]:
-        parsed = parse_yes_no(value) if isinstance(value, str) else value
-        if parsed is None:
+        if isinstance(value, bool):
+            pass
+        elif isinstance(value, str):
+            value = value.strip().lower() in ["yes", "y", "true", "sure", "ok", "okay", "i do", "correct", "ja", "si", "da", "oui", "si", "confirm"]
+        else:
             return
-        value = parsed
     if path.startswith("productOptions."):
         parts = path.split(".")
         if len(parts) != 3:
             return
         _, product_id, option = parts
-        if option in ["apostille", "proofOfRepresentation", "needHelpDrafting", "documentsNotReadyYet"]:
-            parsed = parse_yes_no(value) if isinstance(value, str) else value
-            if parsed is None:
-                return
-            value = parsed
+        if isinstance(value, bool):
+            pass
+        elif isinstance(value, str) and option in ["apostille", "proofOfRepresentation", "needHelpDrafting", "documentsNotReadyYet"]:
+            value = value.strip().lower() in ["yes", "y", "true", "sure", "ok", "okay", "i do", "correct", "ja", "si", "da", "oui", "si", "confirm"]
         options = state.get("productOptions") or {}
         product_options = options.get(product_id) or {}
         product_options[option] = value
@@ -363,7 +366,10 @@ def set_state_path(path, value):
             st.session_state.submit_confirmation_requested = False
             state["confirmedPrice"] = None
         return
+    dict_fields = {"billingDetails", "contactDetails", "shippingDetails", "productOptions"}
     if "." not in path:
+        if path in dict_fields:
+            return
         if path in state:
             state[path] = value
         return
@@ -667,7 +673,7 @@ def resolve_timeslot_label():
     if schema_label:
         return schema_label
     country = normalize_country(st.session_state.booking_state.get("destinationCountry"))
-    if country == "AT" and AT_TIMESLOT_LABEL_FALLBACK:
+    if country and AT_TIMESLOT_LABEL_FALLBACK:
         return AT_TIMESLOT_LABEL_FALLBACK
     if country and DEFAULT_TIMESLOT_LABEL_FALLBACK:
         return DEFAULT_TIMESLOT_LABEL_FALLBACK
@@ -695,6 +701,8 @@ def missing_fields():
         return missing
     if state.get("actorType") == "business" and not state.get("businessFlow"):
         missing.append("businessFlow")
+        return missing
+    if state.get("actorType") == "business" and state.get("businessFlow") == "book_for_client":
         return missing
     if not state.get("intent"):
         missing.append("intent")
@@ -770,7 +778,8 @@ def format_slot_time(iso_value):
     try:
         dt = datetime.fromisoformat(iso_value.replace("Z", "+00:00"))
         local = dt.astimezone(ZoneInfo(DEFAULT_TIMEZONE))
-        return local.strftime("%A, %B %d at %H:%M Vienna time")
+        tz_abbr = local.strftime("%Z")
+        return local.strftime(f"%A, %B %d at %H:%M {tz_abbr} time")
     except Exception:
         return iso_value or "available time"
 
@@ -791,17 +800,7 @@ def format_timeslots(slots, start_offset=0, end_offset=7):
     if len(slots) > len(visible):
         lines.append("I found more times too. Say 'show more' if you want later options.")
     lines.append("Which one works best for you?")
-    return "\n".join(lines)
-
-
-def user_asks_for_times(text):
-    normalized = (text or "").lower()
-    return any(phrase in normalized for phrase in ["slots", "times", "availability", "appointments", "schedule", "when are you available"])
-
-
-def user_asks_show_more(text):
-    normalized = (text or "").lower()
-    return any(phrase in normalized for phrase in ["show more", "more times", "more slots", "later options", "more options"])
+    return "<br>".join(lines)
 
 
 def format_more_timeslots():
@@ -817,51 +816,8 @@ def format_more_timeslots():
     if len(slots) > st.session_state.shown_timeslot_count:
         lines.append("Say 'show more' if you want to see additional times.")
     lines.append("Which one works best for you?")
-    return "\n".join(lines)
+    return "<br>".join(lines)
 
-
-def parse_timeslot_choice(text):
-    choice = (text or "").strip().lower()
-    digits = "".join(char for char in choice if char.isdigit())
-    if digits:
-        number = int(digits)
-        if 1 <= number <= 99:
-            return number - 1
-    mapping = {
-        "1": 0,
-        "first": 0,
-        "first one": 0,
-        "one": 0,
-        "2": 1,
-        "second": 1,
-        "second one": 1,
-        "two": 1,
-        "3": 2,
-        "third": 2,
-        "third one": 2,
-        "three": 2,
-        "4": 3,
-        "fourth": 3,
-        "four": 3,
-        "5": 4,
-        "fifth": 4,
-        "five": 4,
-    }
-    if choice in mapping:
-        return mapping[choice]
-    for token, index in mapping.items():
-        if f" {token} " in f" {choice} ":
-            return index
-    return None
-
-
-def user_confirmed_submit(text, llm_result):
-    if llm_result.get("userConfirmedSubmit") is True:
-        return True
-    normalized = (text or "").lower()
-    return st.session_state.submit_confirmation_requested and any(
-        phrase in normalized for phrase in ["yes", "submit", "confirm", "go ahead", "send it", "book it"]
-    )
 
 
 def format_price_response(response):
@@ -873,7 +829,6 @@ def format_price_response(response):
     lines = [f"The confirmed price from Notarity is {money(total)}:"]
     for item in body:
         lines.append(f"- {item.get('name')}: {money(item.get('net', 0) / 100)}")
-    lines.append("Do you want me to submit the appointment request?")
     st.session_state.submit_confirmation_requested = True
     return "\n".join(lines)
 
@@ -881,7 +836,7 @@ def format_price_response(response):
 def format_unpriced_confirmation():
     st.session_state.booking_state["confirmedPrice"] = 0
     st.session_state.submit_confirmation_requested = True
-    return "Everything is ready. This service does not show an online price here. Do you want me to submit the appointment request?"
+    return "Everything is ready for submission."
 
 
 def required_files_missing():
@@ -897,12 +852,6 @@ def document_is_available():
 
 def run_automatic_actions(user_text, llm_result):
     messages = []
-
-    choice_index = parse_timeslot_choice(user_text)
-    slots = offered_timeslot_options()
-    if choice_index is not None and choice_index < len(slots):
-        st.session_state.booking_state["timeslotId"] = slots[choice_index]["id"]
-        messages.append("I saved that appointment time.")
 
     requested = llm_result.get("requestedAction") or "none"
     if not pricing_available_for_selected_products():
@@ -926,30 +875,49 @@ def run_automatic_actions(user_text, llm_result):
     if is_business:
         return messages
 
-    should_fetch_times = requested == "fetch_timeslots" or (
-        user_asks_for_times(user_text)
-        and st.session_state.booking_state.get("destinationCountry")
-        and st.session_state.booking_state.get("selectedProductIds")
-        and resolve_timeslot_label()
-        and not st.session_state.booking_state.get("timeslotId")
-    )
-    if should_fetch_times:
+    if requested == "fetch_timeslots":
+        if not ready_for_timeslots():
+            missing = missing_fields()
+            pre_missing = [f for f in missing if f != "timeslotId"]
+            if pre_missing:
+                st.session_state.asking_field = pre_missing[0]
+            return messages
         label = resolve_timeslot_label()
         if label:
             slots, start_offset, end_offset = fetch_available_timeslots(label)
             messages.append(format_timeslots(slots, start_offset, end_offset))
-    elif user_asks_for_times(user_text) and st.session_state.booking_state.get("destinationCountry") and not st.session_state.booking_state.get("selectedProductIds"):
-        messages.append("Let me first find the right service for your document. What type of notarization do you need?")
-    elif user_asks_for_times(user_text) and not st.session_state.booking_state.get("destinationCountry"):
-        messages.append("Which country will the document be used in? I need that to find the right appointment calendar.")
+        return messages
 
-    confirmed_submit = user_confirmed_submit(user_text, llm_result)
-    if confirmed_submit:
+    if requested == "show_more_timeslots":
+        slots = offered_timeslot_options()
+        start = st.session_state.shown_timeslot_count or 0
+        messages.append(format_more_timeslots())
+        return messages
+
+    if requested == "price":
+        if pricing_available_for_selected_products():
+            response = price_appointment(build_payload())
+            st.session_state.price_response = response
+            messages.append(format_price_response(response))
+        else:
+            clear_pricing_state()
+            messages.append(format_unpriced_confirmation())
+        return messages
+
+    if llm_result.get("userConfirmedSubmit") is True:
         if st.session_state.submit_response and st.session_state.submit_response.get("status") in [200, 201]:
             return messages
         if not st.session_state.price_response and pricing_available_for_selected_products():
-            messages.append("I need to price the request before I can submit it.")
-        elif required_files_missing():
+            missing = missing_fields()
+            if missing:
+                st.session_state.asking_field = missing[0]
+                st.session_state.submit_confirmation_requested = False
+                return messages
+            response = price_appointment(build_payload())
+            st.session_state.price_response = response
+            messages.append(format_price_response(response))
+            return messages
+        if required_files_missing():
             messages.append("Before I submit, please upload the required document files so they can be attached to the request.")
         else:
             response = submit_appointment(build_payload(), uploaded_file_parts())
@@ -1130,6 +1098,9 @@ def _auto_draft_title():
 def build_draft_payload():
     form = get_booking_form() or {}
     payload = build_payload()
+    for product in payload.get("products", []):
+        product["files"] = []
+        product["documentsNotReadyYet"] = True
     payload.update(
         {
             "_bookingForm": form.get("id"),
@@ -1156,6 +1127,94 @@ def build_draft_payload():
     return payload
 
 
+def build_state_shape():
+    form = get_booking_form() or {}
+    shape = {
+        "actorType": "customer | business | null",
+        "businessFlow": "book_for_client | null",
+        "intent": "string or null",
+        "destinationCountry": "ISO alpha-2 or null",
+        "documentReady": "boolean or null",
+        "documentsNotReadyYet": "boolean or null",
+        "hardCopy": "boolean or null",
+        "expressShipping": "boolean or null",
+        "contactDetailsSameAsBilling": "boolean or null",
+        "shippingDetailsSameAsBilling": "boolean or null",
+        "preferredNotary": "string or null",
+        "timeslotId": "string or null",
+        "participantName": "string or null",
+        "participantEmail": "string or null",
+        "participantPhone": "string or null",
+        "confirmedPrice": "number or null",
+        "language": "string or null",
+        "timezone": "string or null",
+        "submitConfirmationRequested": "boolean or null",
+    }
+    option_fields = {}
+    for product in allowed_products():
+        raw = product.get("raw") or {}
+        if raw.get("showApostille"):
+            option_fields["apostille"] = "boolean or null"
+        if raw.get("showProofOfRepresentation"):
+            option_fields["proofOfRepresentation"] = "boolean or null"
+        if raw.get("showNeedHelpDrafting"):
+            option_fields["needHelpDrafting"] = "boolean or null"
+    if option_fields:
+        shape["productOptions"] = {"<productId>": option_fields}
+    component_accessors = {}
+    for page in form.get("pages", []):
+        for component in collect_components(page.get("components", [])):
+            accessor = component.get("accessor")
+            if accessor and accessor not in shape:
+                component_accessors[accessor] = component
+    for accessor in component_accessors:
+        shape[accessor] = "string or null"
+    nested_parents = {}
+    for accessor in list(shape.keys()):
+        if "." in accessor:
+            parent, field = accessor.split(".", 1)
+            if parent not in nested_parents:
+                nested_parents[parent] = {}
+            type_map = {
+                "business": "boolean",
+                "countryCode": "ISO alpha-2 or null",
+            }
+            nested_parents[parent][field] = type_map.get(field, "string or null")
+            del shape[accessor]
+    for parent, fields in nested_parents.items():
+        shape[parent] = fields
+    for obj in ["billingDetails", "contactDetails", "shippingDetails"]:
+        if obj not in shape:
+            shape[obj] = "object or null"
+    return shape
+
+
+def build_product_option_rules():
+    rules = []
+    has_apostille_product = False
+    for product in allowed_products():
+        raw = product.get("raw") or {}
+        pid = product.get("id")
+        if raw.get("showApostille"):
+            has_apostille_product = True
+            rules.append(
+                f"If missingFields contains productOptions.{pid}.apostille, ask whether the customer needs an apostille for that selected product before pricing. Store the answer under productOptions using that exact product ID."
+            )
+        if raw.get("showProofOfRepresentation"):
+            rules.append(
+                f"If missingFields contains productOptions.{pid}.proofOfRepresentation, ask whether the customer needs proof of representation for that selected product before pricing. Store the answer under productOptions using that exact product ID."
+            )
+        if raw.get("showNeedHelpDrafting"):
+            rules.append(
+                f"If missingFields contains productOptions.{pid}.needHelpDrafting, ask whether drafting help is needed for that selected product before pricing. Only ask this for business users without uploaded or extracted document text. Never ask drafting-help questions for customers or when a document is already available."
+            )
+    if has_apostille_product:
+        rules.append(
+            "Do not ask for apostille when apostilleRequired is true; the app will include it automatically. Only ask when showApostille is true and the option is missing."
+        )
+    return rules
+
+
 def openai_turn(user_message):
     api_key = os.environ.get("OPENAI_API_KEY") or st.session_state.get("openai_api_key")
     if not api_key or OpenAI is None:
@@ -1172,61 +1231,7 @@ def openai_turn(user_message):
     previous_assistant = next((m["content"] for m in reversed(st.session_state.messages) if m["role"] == "assistant"), "")
     prompt = {
         "role": "Notarity Copilot",
-        "rules": [
-            "Continue a short conversation. Ask exactly one concise question unless ready for pricing.",
-            "Before collecting booking details, determine whether the user is booking as the customer or preparing this for a client as a business. Set actorType to 'customer' or 'business'.",
-            "If actorType is business, auto-set businessFlow to 'book_for_client'. Do not ask which sub-flow.",
-            "Business defaults may come from schema defaultValue or admin configuration. Do not assume they are global.",
-            "prefilledValues contains known default values from the booking form configuration and business setup. For business book_for_client, where a value is available in prefilledValues, present it to the user for confirmation instead of asking from scratch. For example: 'The configuration has jane@example.com for the participant email. Is that correct?' If the user says no, ask for the correct value.",
-            "For business book_for_client: all missingFields are optional. Ask about them one at a time; allow the business to skip any. Do NOT ask for timeslots. Do NOT call pricing. When the business says they are ready (or enough info is filled), set requestedAction to 'save_draft'.",
-            "The customer often does not know what they need. If they say they do not know, ask for a document or ask a broader outcome question.",
-            "A document is optional at the start. If the customer does not have a document, continue by asking what they need notarized or what outcome they want.",
-            "When collecting country fields, return ISO alpha-2 country codes in stateUpdates, such as AT, ES, LT, US, or GB.",
-            "If the customer uses a colloquial or localized country name, normalize it to the correct ISO alpha-2 code when you are confident; otherwise ask a clarification question.",
-            "Do not ask the customer to upload a document unless the selected product requires files before final submit.",
-            "If the customer says they do not have the document yet, set documentReady to false and documentsNotReadyYet to true, then continue the booking conversation.",
-            "Examples of no-document needs include notarizing a signature, getting a certified copy, creating a power of attorney, or certifying specific facts.",
-            "If the user asks you to read or inspect the document and documentText is empty, ask them to upload the document.",
-            "If the user asks you to read or inspect the document and documentText is present, infer only the booking-relevant facts from the document.",
-            "Customers usually do not know the Notarity product they need; never expect them to name a product.",
-            "Use documentText, latestUserMessage, bookingState, and allowedProducts to identify the best product yourself.",
-            "When documentText is available, use it as the primary evidence for product selection.",
-            "If one allowed product clearly matches the document or stated outcome, select it in selectedProductIds and continue to the next missing booking field.",
-            "Only ask a product clarification question when multiple allowedProducts plausibly fit and the documentText does not distinguish them.",
-            "If documentText is unrelated to any allowedProducts, such as a CV/resume or an informational document with no apparent notarization need, do not select a product.",
-            "For unsuitable or unrelated documents, politely say that the document does not appear to match the available notarization services and ask what the customer needs notarized or certified.",
-            "Never force a product match just because products are available; selectedProductIds must stay empty unless the document or user outcome clearly fits an allowed product.",
-            "Your goal is to complete a Notarity appointment request, not to fully analyze the document.",
-            "Do not ask about legal, business, meeting, transaction, or document-content details unless they are required to choose one allowed product.",
-            "If the document type is clear, proceed with product selection and the next missing booking field instead of asking about the document's purpose.",
-            "If the user says they do not know, asks you to check the document, or says you do not need that information, never repeat the same question; move to the next missing booking field.",
-            "If latestUserMessage answers previousAssistantQuestion, update the matching state field and do not ask for that field again.",
-            "If the customer provides multiple details in one answer, extract and update all matching fields at once; do not ask again for fields already present in that answer.",
-            "If you infer a required field value from documentText, ask the customer to confirm it before treating it as final.",
-            "During document review, prefer confirming extracted required fields before asking for fields that are still unknown.",
-            "For document-derived values, ask in this format: 'I found [value] as [field label]. Is that correct?' Use customer-safe labels: participantName = 'the participant's full name', participantEmail = 'the participant's email address', participantPhone = 'the participant's phone number'. Never say 'your name' or 'your full name' for participant fields.",
-            "When assistantMessage asks for confirmation of a document-derived value, set confirmingField and confirmingValue, and set askingField to null.",
-            "Ask only for fields in missingFields unless product selection is truly impossible from allowedProducts and documentText.",
-            "Whenever assistantMessage asks the customer for a booking field, set askingField to the exact missingFields path being requested.",
-            "Ask product option questions only when missingFields contains the exact productOptions.<productId>.<option> path. Product option availability comes only from selected product config, never from country or product name.",
-            "If missingFields contains productOptions.<productId>.apostille, ask whether the customer needs an apostille for that selected product before pricing. Store the answer under productOptions using that exact product ID.",
-            "If missingFields contains productOptions.<productId>.proofOfRepresentation, ask whether the customer needs proof of representation for that selected product before pricing. Store the answer under productOptions using that exact product ID.",
-            "If missingFields contains productOptions.<productId>.needHelpDrafting, ask whether drafting help is needed for that selected product before pricing. Only ask this for business users without uploaded or extracted document text. Never ask drafting-help questions for customers or when a document is already available.",
-            "Do not ask for apostille when apostilleRequired is true; the app will include it automatically. Only ask when showApostille is true and the option is missing.",
-            "If assistantMessage is not asking for a customer field, set askingField to null.",
-            "For power of attorney documents, choose Signature notarisation when it is available and no more specific allowed product is clearly required.",
-            "Never repeat the previous assistant question verbatim.",
-            "Do not expose internal routing, product IDs, prices, timeslot IDs, or schema internals to the user.",
-            "Never mention APIs, endpoints, payloads, schemas, backend calls, or technical infrastructure to the customer.",
-            "You may only select product IDs from allowedProducts. If none fit, ask a clarifying question.",
-            "Do not invent product IDs, booking form IDs, timeslot IDs, prices, or draft IDs.",
-            "Do not ask the final submit-confirmation question yourself. The app asks that automatically after pricing or after a non-priced request is complete. If the user confirms submission, set userConfirmedSubmit to true.",
-            "Ask exactly one question at a time. Never ask two questions in the same message.",
-            "Ask whether contact details are the same as billing details before pricing or submission. Store the answer in contactDetailsSameAsBilling.",
-            "If hardCopy is true, ask whether express shipping is needed and store it in expressShipping before pricing. Also ask whether the shipping destination is the same as billing details and store it in shippingDetailsSameAsBilling.",
-            "If hardCopy is true and shippingDetailsSameAsBilling is false, collect shippingDetails fields one at a time: firstName, lastName, email, phoneNumber, address, zipCode, city, and countryCode.",
-            "For customer bookings, once you have collected destinationCountry, participantName, participantEmail, participantPhone, billingDetails (lastName, address, zipCode, city, countryCode), hardCopy preference, contactDetailsSameAsBilling, and any required hard-copy shipping fields, set requestedAction to 'fetch_timeslots' to offer appointment times. For business book_for_client, never fetch timeslots.",
-        ],
+        "rules": PROMPT_RULES + build_product_option_rules(),
         "conversation": st.session_state.messages[-8:],
         "latestUserMessage": user_message,
         "previousAssistantQuestion": previous_assistant,
@@ -1236,59 +1241,23 @@ def openai_turn(user_message):
         "bookingState": st.session_state.booking_state,
         "schemaSummary": schema_summary(),
         "allowedProducts": allowed,
+        "offeredTimeslots": st.session_state.offered_timeslots or [],
         "missingFields": missing_fields(),
         "prefilledValues": prefilled_values(),
         "availableActions": {
-            "fetchTimeslots": bool(resolve_timeslot_label() and not st.session_state.booking_state.get("timeslotId")),
-            "price": ready_for_pricing() and pricing_available_for_selected_products(),
-            "submit": bool(st.session_state.price_response),
+            "fetchTimeslots": ready_for_timeslots(),
             "saveDraft": st.session_state.booking_state.get("actorType") == "business",
         },
+        "submitConfirmationRequested": st.session_state.submit_confirmation_requested,
         "documentText": compact(st.session_state.document_text, limit=6000),
         "returnJsonShape": {
             "assistantMessage": "string",
-            "stateUpdates": {
-                "actorType": "customer | business | null",
-                "businessFlow": "book_for_client | null",
-                "intent": "string or null",
-                "destinationCountry": "ISO alpha-2 or null",
-                "participantName": "string or null",
-                "participantEmail": "string or null",
-                "participantPhone": "string or null",
-                "documentReady": "boolean or null",
-                "documentsNotReadyYet": "boolean or null",
-                "productOptions": {
-                    "<productId>": {
-                        "apostille": "boolean or null",
-                        "proofOfRepresentation": "boolean or null",
-                        "needHelpDrafting": "boolean or null"
-                    }
-                },
-                "hardCopy": "boolean or null",
-                "expressShipping": "boolean or null",
-                "contactDetailsSameAsBilling": "boolean or null",
-                "shippingDetailsSameAsBilling": "boolean or null",
-                "preferredNotary": "string or null",
-                "billingDetails": {
-                    "firstName": "string or null",
-                    "lastName": "string or null",
-                    "email": "string or null",
-                    "phoneNumber": "string or null",
-                    "address": "string or null",
-                    "zipCode": "string or null",
-                    "city": "string or null",
-                    "stateProvince": "string or null",
-                    "countryCode": "ISO alpha-2 or null",
-                    "business": "boolean"
-                },
-                "contactDetails": "object or null",
-                "shippingDetails": "object or null",
-            },
+            "stateUpdates": build_state_shape(),
             "selectedProductIds": ["IDs from allowedProducts only"],
             "detectedFacts": ["short facts"],
             "needsDocumentUpload": "boolean",
             "readyForPricing": "boolean",
-            "requestedAction": "none | fetch_timeslots | price | submit | save_draft",
+            "requestedAction": "none | fetch_timeslots | show_more_timeslots | price | save_draft",
             "userConfirmedSubmit": "boolean",
             "askingField": "one missing field path you are asking for, e.g. participantEmail or billingDetails.address, or null",
             "confirmingField": "one field path for a document-derived value being confirmed, or null",
@@ -1337,7 +1306,13 @@ def openai_turn(user_message):
 
 def apply_state(updates):
     state = st.session_state.booking_state
+    dict_fields = {"billingDetails", "contactDetails", "shippingDetails", "productOptions"}
     for key, value in (updates or {}).items():
+        if key == "submitConfirmationRequested" and isinstance(value, bool):
+            st.session_state.submit_confirmation_requested = value
+            continue
+        if key in dict_fields and not isinstance(value, dict):
+            continue
         if key in state and value not in [None, "", [], {}]:
             if key == "destinationCountry":
                 value = normalize_country(value)
@@ -1367,61 +1342,37 @@ def apply_user_answer_from_previous_question(user_text):
     answer = (user_text or "").strip()
     if not answer:
         return
-    confirming_field = st.session_state.get("confirming_field")
-    if confirming_field:
-        confirmed = parse_yes_no(answer)
-        if confirmed is True:
-            set_state_path(confirming_field, st.session_state.get("confirming_value"))
-            st.session_state.confirming_field = None
-            st.session_state.confirming_value = None
-            return
-        if confirmed is False:
-            st.session_state.confirming_field = None
-            st.session_state.confirming_value = None
-            st.session_state.asking_field = confirming_field
-            return
-        set_state_path(confirming_field, answer)
-        st.session_state.confirming_field = None
-        st.session_state.confirming_value = None
-        return
     asking_field = st.session_state.get("asking_field")
     if asking_field:
+        is_business = st.session_state.booking_state.get("actorType") == "business" and st.session_state.booking_state.get("businessFlow") == "book_for_client"
+        if is_business and answer.lower() in ["no need", "skip", "nothing", "n/a", "none", "not needed", "no"]:
+            st.session_state.asking_field = None
+            return
+        if asking_field == "destinationCountry":
+            normalized = normalize_country(answer)
+            set_state_path(asking_field, normalized or answer)
+            st.session_state.asking_field = None
+            return
         set_state_path(asking_field, answer)
         st.session_state.asking_field = None
         return
-    previous = next((m["content"] for m in reversed(st.session_state.messages) if m["role"] == "assistant"), "").lower()
-    state = st.session_state.booking_state
-    billing = state.get("billingDetails") or {}
-
-    if "email" in previous and "participant" in previous:
-        state["participantEmail"] = answer
-        billing["email"] = answer
-    elif "phone" in previous and "participant" in previous:
-        state["participantPhone"] = answer
-        billing["phoneNumber"] = answer
-    elif "name" in previous and ("participant" in previous or "your name" in previous):
-        state["participantName"] = answer
-        first, last = split_name(answer)
-        billing.setdefault("firstName", first)
-        if last:
-            billing.setdefault("lastName", last)
-    elif "last name" in previous and "billing" in previous:
-        billing["lastName"] = answer
-    elif "address" in previous and "billing" in previous:
-        billing.update(parse_address_details(answer))
-    elif ("zip" in previous or "postal" in previous) and "billing" in previous:
-        billing["zipCode"] = answer
-    elif "city" in previous and "billing" in previous:
-        billing["city"] = answer
-    elif ("country code" in previous or "billing country" in previous or "country for the billing" in previous) and "billing" in previous:
-        billing["countryCode"] = normalize_country(answer)
-
-    if billing:
-        state["billingDetails"] = billing
 
 
 def ready_for_timeslots():
-    return bool(resolve_timeslot_label() and not st.session_state.booking_state.get("timeslotId"))
+    if not resolve_timeslot_label():
+        return False
+    if st.session_state.booking_state.get("timeslotId"):
+        return False
+    missing = missing_fields()
+    post_timeslot = {"hardCopy", "expressShipping", "contactDetailsSameAsBilling", "shippingDetailsSameAsBilling"}
+    non_timeslot_missing = [
+        f for f in missing
+        if f != "timeslotId"
+        and f not in post_timeslot
+        and not f.startswith("contactDetails.")
+        and not f.startswith("shippingDetails.")
+    ]
+    return len(non_timeslot_missing) == 0
 
 
 def ready_for_pricing():
@@ -1436,10 +1387,8 @@ def render_hero():
     st.markdown(
         """
         <div class="hero">
-          <div class="eyebrow">Notarity Copilot</div>
-          <div class="hero-title">A short conversation instead of a booking form.</div>
-          <p>OpenAI understands the customer. Notarity's booking rules keep the appointment valid from start to finish.</p>
-          <span class="pill">No predefined cases</span><span class="pill">Guided by real booking rules</span><span class="pill">Optional document upload</span><span class="pill">Real appointment times</span>
+          <div class="eyebrow">Notarity</div>
+          <div class="hero-title">Book your notarisation in minutes — just by chatting.</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1451,7 +1400,7 @@ def render_chat():
     st.subheader("Conversation")
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
-            st.write(message["content"])
+            st.markdown(message["content"], unsafe_allow_html=True)
 
     upload_label = "Uploaded documents" if st.session_state.uploaded_files else "Upload documents if you have them"
     files = st.file_uploader(upload_label, type=["pdf"], accept_multiple_files=True, key="chat_upload")
@@ -1482,8 +1431,11 @@ def render_chat():
     user_message = st.chat_input("Reply to the assistant...")
     if user_message:
         st.session_state.messages.append({"role": "user", "content": user_message})
-        if user_asks_show_more(user_message):
-            st.session_state.messages.append({"role": "assistant", "content": format_more_timeslots()})
+        show_more_phrases = ["show more", "more times", "more slots", "more options", "later options", "weitere"]
+        if any(p in user_message.lower() for p in show_more_phrases) and st.session_state.offered_timeslots:
+            action_messages = [format_more_timeslots()]
+            for message in action_messages:
+                st.session_state.messages.append({"role": "assistant", "content": message})
             st.rerun()
         apply_user_answer_from_previous_question(user_message)
         with st.spinner("Thinking and checking appointment options..."):
