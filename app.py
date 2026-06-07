@@ -22,7 +22,7 @@ except ImportError:  # pragma: no cover
 
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 except ImportError:
     pass
 
@@ -234,6 +234,8 @@ def save_appointment_request_draft(payload):
     api_key = os.environ.get("NOTARITY_API_KEY") or st.session_state.get("notarity_api_key")
     if not api_key:
         return {"status": 401, "body": {"message": "Draft API key is missing."}, "text": "Draft API key is missing."}
+    if not NOTARITY_DRAFT_PASSWORD:
+        return {"status": 401, "body": {"message": "Draft password is missing. Set NOTARITY_DRAFT_PASSWORD."}, "text": "Draft password is missing."}
     response = requests.post(
         f"{BASE_URL}/api/v1/appointment-request-drafts",
         headers={"accept": "application/json, text/plain, */*", "x-api-key": api_key},
@@ -245,6 +247,21 @@ def save_appointment_request_draft(payload):
     except ValueError:
         body = response.text
     return {"status": response.status_code, "body": body, "text": response.text}
+
+
+def draft_response_url(response):
+    body = response.get("body") if isinstance(response, dict) else None
+    if not isinstance(body, dict):
+        return ""
+    for key in ["url", "shareUrl"]:
+        if body.get(key):
+            return body[key]
+    data = body.get("data")
+    if isinstance(data, dict):
+        for key in ["url", "shareUrl"]:
+            if data.get(key):
+                return data[key]
+    return ""
 
 
 def extract_pdf_text(file_bytes):
@@ -863,13 +880,16 @@ def run_automatic_actions(user_text, llm_result):
         response = save_appointment_request_draft(build_draft_payload())
         st.session_state.draft_response = response
         if response.get("status") in [200, 201]:
-            draft_url = response.get("body", {}).get("url", "")
+            draft_url = draft_response_url(response)
             if draft_url:
                 messages.append(f"The draft has been prepared successfully. Share this link with your client: {draft_url}")
             else:
                 messages.append("The draft has been prepared successfully.")
         else:
-            messages.append("I tried to prepare the draft, but something went wrong. Please check the draft settings and try again.")
+            body = response.get("body") if isinstance(response, dict) else None
+            detail = body.get("message") if isinstance(body, dict) else response.get("text", "")
+            suffix = f" {detail}" if detail else ""
+            messages.append(f"I tried to prepare the draft, but something went wrong. Please check the draft settings and try again.{suffix}")
         return messages
 
     if is_business:
@@ -895,6 +915,11 @@ def run_automatic_actions(user_text, llm_result):
         return messages
 
     if requested == "price":
+        if not ready_for_pricing():
+            missing = missing_fields()
+            if missing:
+                st.session_state.asking_field = missing[0]
+            return messages
         if pricing_available_for_selected_products():
             response = price_appointment(build_payload())
             st.session_state.price_response = response
@@ -989,6 +1014,82 @@ def product_payloads():
 def split_name(name):
     parts = (name or "Client").split()
     return parts[0], " ".join(parts[1:])
+
+
+def is_email(value):
+    return isinstance(value, str) and bool(re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", value.strip()))
+
+
+def clean_optional(value):
+    if isinstance(value, dict):
+        cleaned = {k: clean_optional(v) for k, v in value.items()}
+        return {k: v for k, v in cleaned.items() if v not in [None, "", [], {}]}
+    if isinstance(value, list):
+        cleaned = [clean_optional(v) for v in value]
+        return [v for v in cleaned if v not in [None, "", [], {}]]
+    if isinstance(value, str):
+        value = value.strip()
+    return value
+
+
+def valid_country_code(value):
+    value = normalize_country(value)
+    return value if value and len(value) <= 2 else None
+
+
+def clean_draft_contact(details, require_address=False):
+    details = clean_optional(details or {})
+    if not details:
+        return None
+    if details.get("email") and not is_email(details.get("email")):
+        details.pop("email", None)
+    if details.get("countryCode"):
+        country = valid_country_code(details.get("countryCode"))
+        if country:
+            details["countryCode"] = country
+        else:
+            details.pop("countryCode", None)
+    required = ["lastName", "email"]
+    if require_address:
+        required.extend(["address", "zipCode", "city", "countryCode"])
+    if any(not details.get(field) for field in required):
+        return None
+    return details
+
+
+def clean_draft_payload(payload):
+    payload = clean_optional(payload)
+    participants = []
+    for participant in payload.get("participants") or []:
+        participant = clean_optional(participant)
+        if is_email(participant.get("email")):
+            participants.append(participant)
+    if participants:
+        payload["participants"] = participants
+    else:
+        payload.pop("participants", None)
+    billing = clean_draft_contact(payload.get("billingDetails"), require_address=True)
+    if billing:
+        payload["billingDetails"] = billing
+    else:
+        payload.pop("billingDetails", None)
+    contact = clean_draft_contact(payload.get("contactDetails"), require_address=False)
+    if contact:
+        payload["contactDetails"] = contact
+    else:
+        payload.pop("contactDetails", None)
+    shipping = clean_draft_contact(payload.get("shippingDetails"), require_address=True)
+    if shipping:
+        payload["shippingDetails"] = shipping
+    else:
+        payload.pop("shippingDetails", None)
+    if payload.get("destinationCountry"):
+        country = valid_country_code(payload.get("destinationCountry"))
+        if country:
+            payload["destinationCountry"] = country
+        else:
+            payload.pop("destinationCountry", None)
+    return payload
 
 
 def build_payload():
@@ -1118,13 +1219,7 @@ def build_draft_payload():
         del payload["timeslots"]
     if not payload.get("products"):
         del payload["products"]
-    if payload.get("billingDetails") and not payload["billingDetails"].get("lastName"):
-        del payload["billingDetails"]
-    if payload.get("contactDetails") and not payload["contactDetails"].get("lastName"):
-        del payload["contactDetails"]
-    if payload.get("shippingDetails") and not payload["shippingDetails"].get("lastName"):
-        del payload["shippingDetails"]
-    return payload
+    return clean_draft_payload(payload)
 
 
 def build_state_shape():
@@ -1345,8 +1440,7 @@ def apply_user_answer_from_previous_question(user_text):
     asking_field = st.session_state.get("asking_field")
     if asking_field:
         is_business = st.session_state.booking_state.get("actorType") == "business" and st.session_state.booking_state.get("businessFlow") == "book_for_client"
-        if is_business and answer.lower() in ["no need", "skip", "nothing", "n/a", "none", "not needed", "no"]:
-            st.session_state.asking_field = None
+        if is_business:
             return
         if asking_field == "destinationCountry":
             normalized = normalize_country(answer)
@@ -1395,6 +1489,13 @@ def render_hero():
     )
 
 
+def should_show_llm_message(result):
+    requested = result.get("requestedAction") or "none"
+    if requested == "save_draft" or result.get("userConfirmedSubmit") is True:
+        return False
+    return True
+
+
 def render_chat():
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("Conversation")
@@ -1423,7 +1524,8 @@ def render_chat():
         st.session_state.document_review_started = False
         st.session_state.last_llm_json = result
         st.session_state.llm_source = source
-        st.session_state.messages.append({"role": "assistant", "content": result.get("assistantMessage") or "What should we clarify next?"})
+        if should_show_llm_message(result):
+            st.session_state.messages.append({"role": "assistant", "content": result.get("assistantMessage") or "What should we clarify next?"})
         for message in action_messages:
             st.session_state.messages.append({"role": "assistant", "content": message})
         st.rerun()
@@ -1443,7 +1545,8 @@ def render_chat():
             action_messages = run_automatic_actions(user_message, result)
         st.session_state.last_llm_json = result
         st.session_state.llm_source = source
-        st.session_state.messages.append({"role": "assistant", "content": result.get("assistantMessage") or "What should we clarify next?"})
+        if should_show_llm_message(result):
+            st.session_state.messages.append({"role": "assistant", "content": result.get("assistantMessage") or "What should we clarify next?"})
         for message in action_messages:
             st.session_state.messages.append({"role": "assistant", "content": message})
         st.rerun()
