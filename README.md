@@ -37,7 +37,7 @@ Supports both direct customer bookings and business workflows by generating secu
 ## Demo
 
 - **Live demo:** Run locally (see instructions below)
-- **Screenshots / video:** `<link>`
+- **Screenshots / video:** https://drive.google.com/drive/folders/1NldWrvdb3hGI7Qyu923bKYmMcSxu9xom?usp=share_link
 
 ## Getting Started
 
