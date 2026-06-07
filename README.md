@@ -2,34 +2,52 @@
 
 Conversation-first Streamlit MVP for the START Hack Vienna '26 Notarity case.
 
-The app lets a customer book by answering short natural-language questions. Gemini interprets the conversation, the app stores structured booking state, and Notarity APIs are used for schema, timeslots, pricing, and debug submission.
+The app lets customers and business users complete Notarity flows through short natural-language chat. OpenAI interprets the conversation, the app stores structured booking state, and Notarity APIs are used for booking schema, products, timeslots, pricing, appointment submission, and business draft links.
 
 ## Run
 
 ```bash
-export GEMINI_API_KEY="your-gemini-api-key"
-# Optional: override the default model
-export GEMINI_MODEL="models/gemini-2.5-flash"
+export OPENAI_API_KEY="your-openai-api-key"
+
+# Optional runtime configuration
+export OPENAI_MODEL="gpt-4.1"
+export NOTARITY_API_BASE_URL="https://staging-api.notarity.com"
+export NOTARITY_WEB_BASE_URL="https://staging.notarity.com"
+export BOOKING_FORM_SLUG="start-vienna-hackathon"
+export NOTARITY_API_KEY="your-draft-api-key"
+export NOTARITY_DRAFT_PASSWORD="notarity-challenge-2026"
+export DEFAULT_DEMO_EMAIL="asetkabdula@gmail.com"
+export DEFAULT_DEMO_PHONE="+43000000000"
+export DEFAULT_TIMEZONE="Europe/Vienna"
+export NOTARITY_REQUEST_MODE="debug"
+
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
 ## Demo Flow
 
-- Users start by answering one assistant question at a time. Uploading documents is optional.
-- Gemini updates structured booking state and asks the next relevant question.
-- If `GEMINI_API_KEY` is not set, the app does not invent a booking path; it asks for a working Gemini key.
-- The UI keeps technical schema/API details in expanders while the main experience remains conversational.
+- The assistant first determines whether the user is a customer or a business user preparing something for a client.
+- Customers answer one concise question at a time; document upload is optional and auto-reviewed when present.
+- OpenAI updates structured booking state and asks only for the next missing field.
 - Product choices come from the visible booking-form schema and `/products/tags`, not hardcoded persona cases.
-- It calls the real schedule API from the conversation when appointment times are needed.
-- It calls the real staging pricing endpoint automatically when the booking state is complete enough.
-- It asks for confirmation in chat and then submits a real multipart debug appointment request after the user confirms.
-- Payload fields are assembled from conversation state, uploaded files, schema visibility, selected products, timeslots, and backend pricing.
+- Timeslot labels are read from the visible schema. If the schema does not expose one, optional env fallbacks can be set with `AT_TIMESLOT_LABEL_FALLBACK` and `DEFAULT_TIMESLOT_LABEL_FALLBACK`.
+- Pricing is called automatically once the booking state is complete enough.
+- Appointment submission uses a real multipart request containing `payload` plus uploaded files.
+- Business draft mode creates a draft link through `/api/v1/appointment-request-drafts`; the lawyer can copy the link and the client can choose remaining details later.
+
+## Configuration Notes
+
+- `NOTARITY_API_BASE_URL` and `NOTARITY_WEB_BASE_URL` keep staging/production URLs configurable.
+- `BOOKING_FORM_SLUG` selects the booking form schema.
+- `NOTARITY_API_KEY` is required only for creating business draft links.
+- `NOTARITY_DRAFT_PASSWORD` is sent in the draft payload.
+- `DEFAULT_DEMO_EMAIL` and `DEFAULT_DEMO_PHONE` are safe demo fallbacks only.
+- `NOTARITY_REQUEST_MODE` defaults to `debug`; change or unset it based on the target environment.
 
 ## Prototype Notes
 
-- `_appointmentRequestDraft` can be sent with the sample ID, a generated demo ID, or omitted because the draft autosave endpoint is not documented in the provided sample.
-- The final payload preview mirrors the `POST /appointment-requests` multipart payload shape.
-- The UI uses `asetkabdula@gmail.com` as the safe demo contact email.
-- The final submit button calls the real staging API manually; it is never triggered automatically.
-- Gemini is used only for intake extraction and question planning. The app still builds the final payload and calls Notarity APIs deterministically.
+- Customer-facing chat avoids technical words like API, endpoint, schema, payload, backend, and HTTP status.
+- Technical responses and generated payloads are visible only in sidebar expanders.
+- Country normalization uses `pycountry` and expects ISO alpha-2 country codes in structured state.
+- The app builds final request payloads deterministically; the LLM only handles intake, extraction, and conversation planning.
