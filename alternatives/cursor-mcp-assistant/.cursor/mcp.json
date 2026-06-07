@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "notarity": {
+      "command": "node",
+      "args": ["notarity-mcp/server.js"],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "ANTHROPIC_API_KEY": "${env:ANTHROPIC_API_KEY}"
+      }
+    }
+  }
+}

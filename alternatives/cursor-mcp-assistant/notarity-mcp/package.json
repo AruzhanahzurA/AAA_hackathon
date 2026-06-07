@@ -1,0 +1,17 @@
+{
+  "name": "notarity-mcp",
+  "version": "1.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "test:mcp": "node test-mcp-tool.js",
+    "test:mcp:flow": "node test-mcp-flow.js",
+    "test:e2e": "node test-e2e-submit.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.101.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "dotenv": "^17.4.2"
+  }
+}

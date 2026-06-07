@@ -159,6 +159,10 @@ Check that your `OPENAI_API_KEY` is correctly configured and verify that your ac
 
 Submitted to the START Hack Vienna '26 GitHub organisation.
 
+## Alternative solution (draft)
+
+A Cursor MCP-based booking assistant lives in [`alternatives/cursor-mcp-assistant/`](alternatives/cursor-mcp-assistant/README.md). Open that folder as a workspace to run it.
+
 ## License
 
 Released under the MIT License — see `LICENSE`.

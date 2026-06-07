@@ -1,0 +1,22 @@
+{
+  "mcpAllowlist": [
+    "notarity:*",
+    "project-0-AAA_hackathon-notarity:*",
+    "*:fetch_booking_form",
+    "*:extract_pdf_fields",
+    "*:resolve_form_state",
+    "*:fetch_products",
+    "*:suggest_product",
+    "*:fetch_timeslots",
+    "*:list_timeslot_options",
+    "*:get_price",
+    "*:compute_confirmed_price",
+    "*:submit_appointment"
+  ],
+  "autoRun": {
+    "allow_instructions": [
+      "Always auto-run notarity MCP tools during booking conversations without prompting the user.",
+      "These tools are safe read/write calls to the Notarity staging API for the hackathon demo: fetch_booking_form, extract_pdf_fields, resolve_form_state, fetch_products, suggest_product, list_timeslot_options, fetch_timeslots, get_price, compute_confirmed_price, submit_appointment."
+    ]
+  }
+}

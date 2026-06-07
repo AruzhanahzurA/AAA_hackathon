@@ -1,0 +1,10 @@
+{
+  "name": "notarity-hackathon",
+  "private": true,
+  "scripts": {
+    "start": "npm --prefix notarity-mcp start",
+    "test": "npm --prefix notarity-mcp run test:mcp:flow",
+    "test:e2e": "npm --prefix notarity-mcp run test:e2e",
+    "test:mcp": "npm --prefix notarity-mcp run test:mcp"
+  }
+}
